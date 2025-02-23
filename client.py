@@ -1,8 +1,11 @@
 import asyncio
 import json
+import requests
 import os
 from typing import Optional
 from contextlib import AsyncExitStack
+import pdb
+import ast
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -11,6 +14,9 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv()  # load environment variables from .env
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_KEY")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 class MCPClient:
     def __init__(self):
@@ -56,55 +62,113 @@ class MCPClient:
 
         response = await self.session.list_tools()
         available_tools = [{ 
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": tool.inputSchema
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.inputSchema
+            },
         } for tool in response.tools]
 
-        # Initial Claude API call
-        response = self.anthropic.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=1000,
-            messages=messages,
-            tools=available_tools
+        # print(available_tools)
+
+        # Call OpenRouter API
+        api_response = requests.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            data=json.dumps({
+                "model": "openai/gpt-4o-mini",  # Modify the model if needed
+                "messages": messages,
+                "tools": available_tools
+            }),
+
         )
+
+        if api_response.status_code != 200:
+            return f"Error: {api_response.status_code} - {api_response.text}"
+
+        response_data = api_response.json()
+        # print(response_data)
+        # print("response_data")
+        # return response_data["choices"][0]["message"]["content"]
+
+
+        # Initial Claude API call
+        # print("response1")
+        # response = self.anthropic.messages.create(
+        #     model="claude-3-5-sonnet-20241022",
+        #     max_tokens=100,
+        #     messages=messages,
+        #     tools=available_tools
+        # )
+
+        # print("response2", api_response)
 
         # Process response and handle tool calls
         tool_results = []
         final_text = []
 
-        for content in response.content:
-            if content.type == 'text':
-                final_text.append(content.text)
-            elif content.type == 'tool_use':
-                tool_name = content.name
-                tool_args = content.input
-                
-                # Execute tool call
-                result = await self.session.call_tool(tool_name, tool_args)
-                tool_results.append({"call": tool_name, "result": result})
-                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+        # pdb.set_trace()
 
-                # Continue conversation with tool results
-                if hasattr(content, 'text') and content.text:
-                    messages.append({
-                    "role": "assistant",
-                    "content": content.text
-                    })
-                messages.append({
-                    "role": "user", 
-                    "content": result.content
-                })
+        tools = api_response.json()["choices"][0]["message"]["tool_calls"]
 
-                # Get next response from Claude
-                response = self.anthropic.messages.create(
-                    model="claude-3-5-sonnet-20241022",
-                    max_tokens=1000,
-                    messages=messages,
-                )
 
-                final_text.append(response.content[0].text)
+        for content in tools:
+            # if content.type == 'text':
+            #     final_text.append(content.text)
+            # elif content.type == 'tool_use':
+            tool_name = content["function"]["name"]
+            tool_args = ast.literal_eval(content["function"]["arguments"])
+            
+            # Execute tool call
+            result = await self.session.call_tool(tool_name, tool_args)
+            # tool_results.append({"call": tool_name, "result": result})
+            final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
 
+            # Continue conversation with tool results
+            # if hasattr(content, 'text') and content.text:
+            messages.append({
+                "role": "assistant",
+                "tool_calls": tools
+            }),
+            messages.append({
+                "role": "tool",
+                "name": tool_name,
+                "tool_call_id": content["id"],
+                "content": result.content[0].text
+            })
+
+            api_response = requests.post(
+                OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                data=json.dumps({
+                    "model": "openai/gpt-4o-mini",  # Modify the model if needed
+                    "messages": messages,
+                }),
+            )
+
+            if api_response.status_code != 200:
+                return f"Error: {api_response.status_code} - {api_response.text}"
+
+                # # Get next response from Claude
+                # response = self.anthropic.messages.create(
+                #     model="claude-3-5-sonnet-20241022",
+                #     max_tokens=1000,
+                #     messages=messages,
+                # )
+
+                # final_text.append(response.content[0].text)
+
+
+            response_data = api_response.json()
+            final_text.append(response_data["choices"][0]["message"]["content"])
+        
         return "\n".join(final_text)
     
 
